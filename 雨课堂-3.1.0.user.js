@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雨课堂刷课助手
 // @namespace    http://tampermonkey.net/
-// @version      3.1.0
+// @version      3.1.1
 // @description  雨课堂课程自动播放与 AI 辅助答题
 // @author       652036
 // @license      GPL3
@@ -27,7 +27,7 @@
 
 const _attachShadow = Element.prototype.attachShadow;
 const basicConf = {
-  version: '3.1.0',
+  version: '3.1.1',
   rate: 3, //用户可改 视频播放速率,可选值[1,1.25,1.5,2,3,16],默认为2倍速，实测4倍速往上有可能出现 bug，3倍速暂时未出现bug，推荐二倍/一倍。
   pptTime: 3000, // 用户可改 ppt播放时间，单位毫秒
 }
@@ -93,6 +93,7 @@ const $ = { // 开发脚本的工具对象
     this.runtime.running = running;
     if (!running) {
       this.runtime.paused = false;
+      $.aiWorkspaceController?.stop();
     }
   },
   isPaused() {
@@ -130,21 +131,46 @@ const $ = { // 开发脚本的工具对象
       await new Promise((resolve) => setTimeout(resolve, 300));
     }
   },
-  ykt_speed() {   // 视频加速
-    const rate = basicConf.rate || 2;
-    let speedwrap = document.getElementsByTagName("xt-speedbutton")[0];
-    let speedlist = document.getElementsByTagName("xt-speedlist")[0];
-    let speedlistBtn = speedlist.firstElementChild.firstElementChild;
-
-    speedlistBtn.setAttribute('data-speed', rate);
-    speedlistBtn.setAttribute('keyt', rate + '.00');
-    speedlistBtn.innerText = rate + '.00X';
-    $.alertMessage('已开启' + rate + '倍速');
-
-    // 模拟点击
-    let mousemove = document.createEvent("MouseEvent");
-    mousemove.initMouseEvent("mousemove", true, true, unsafeWindow, 0, 10, 10, 10, 10, 0, 0, 0, 0, 0, null);
-    speedwrap.dispatchEvent(mousemove);
+  nativeSpeedOverrides: new WeakMap(),
+  ykt_speed(media = document.querySelector('video, audio')) {
+    const rate = Number(basicConf.rate) || 2;
+    const owner = media?.ownerDocument || document;
+    const speedwrap = owner.querySelector('xt-speedbutton');
+    if (!speedwrap) return false;
+    const jq = owner.defaultView?.jQuery;
+    const previous = this.nativeSpeedOverrides.get(speedwrap);
+    if (previous && previous.rate !== rate) {
+      previous.node.setAttribute('data-speed', previous.speed);
+      previous.node.setAttribute('keyt', previous.key);
+      previous.node.textContent = previous.text;
+      if (jq) jq(previous.node).data('speed', Number(previous.speed));
+      this.nativeSpeedOverrides.delete(speedwrap);
+    }
+    const options = Array.from(speedwrap.querySelectorAll('li[data-speed]'));
+    let option = options.find(node => Number(node.dataset.speed) === rate);
+    if (!option && options.length) {
+      option = options[0];
+      this.nativeSpeedOverrides.set(speedwrap, {
+        node: option, speed: option.dataset.speed, key: option.getAttribute('keyt'),
+        text: option.textContent, rate
+      });
+      option.dataset.speed = String(rate);
+      option.setAttribute('keyt', rate.toFixed(2));
+      option.textContent = `${rate.toFixed(2)}X`;
+      if (jq) jq(option).data('speed', rate);
+    }
+    if (!option) return false;
+    const shownRate = parseFloat(speedwrap.querySelector('xt-speedvalue')?.textContent);
+    if (media?.playbackRate === rate && shownRate === rate) return true;
+    option.classList.remove('xt_video_player_common_active');
+    // The native player accepts a speed selection only after movement within its menu.
+    // Update its own setting as well as playbackRate, otherwise timeupdate restores 1x.
+    const MouseEventType = owner.defaultView.MouseEvent;
+    speedwrap.dispatchEvent(new MouseEventType('mouseover', { bubbles: true, clientX: 0, clientY: 0 }));
+    speedwrap.dispatchEvent(new MouseEventType('mousemove', { bubbles: true, clientX: 10, clientY: 10 }));
+    option.click();
+    speedwrap.dispatchEvent(new MouseEventType('mouseout', { bubbles: true }));
+    return media?.playbackRate === rate;
     speedlistBtn.click();
   },
   claim() {   // 视频静音
@@ -822,6 +848,7 @@ function addUserOperate() {
     }
     updateSpeedDisplay();
     $.alertMessage(`✅ 倍速已设置为 ${speedValue}x`);
+    $.aiWorkspaceController?.applyRate();
     console.log('倍速已设置为:', speedValue);
   }
 
@@ -956,12 +983,14 @@ function addUserOperate() {
           video.volume = 0;
           video.playbackRate = window.parent.basicConf.rate;
           video.play();
+          if ($.aiWorkspaceController) runtime.ykt_speed(video);
           resumedMedia = true;
         }
         if (audio) {
           audio.volume = 0;
           audio.playbackRate = window.parent.basicConf.rate;
           audio.play();
+          if ($.aiWorkspaceController) runtime.ykt_speed(audio);
           resumedMedia = true;
         }
       });
@@ -1898,12 +1927,167 @@ function addUserOperate() {
   };
 }
 
+function yuketang_ai_workspace() {
+  const courseRoot = location.pathname.match(/^\/ai-workspace\/lms-graph\/[^/]+/)?.[0];
+  if (!courseRoot) return false;
+  $.aiWorkspaceController?.stop();
+  const getRoute = () => location.pathname + location.search;
+  const isMediaRoute = () => /\/lms-graph\/[^/]+\/(video|audio)\//.test(location.pathname);
+  const getLeaves = () => Array.from(document.querySelectorAll('.leaf-item'));
+  const isMediaLeaf = node => /^(视频|音频)$/.test(node.querySelector('.leaf-item-tag')?.textContent.trim() || '');
+  const titleOf = node => node?.querySelector('.leaf-item-title')?.textContent.trim() || '当前媒体';
+  const state = {
+    route: getRoute(), media: null, prepared: false, started: false, ended: false,
+    changedAt: Date.now(), waitingSince: Date.now(), lastPlayAt: 0,
+    navigation: null, timer: null, listeners: [], completed: new Set(), stopped: false
+  };
+  function unbind() {
+    for (const [type, handler] of state.listeners) state.media?.removeEventListener(type, handler);
+    state.listeners = [];
+    state.media = null;
+    state.prepared = state.started = state.ended = false;
+  }
+  function finish(message) {
+    $.alertMessage(message);
+    $.setRunning(false);
+    const button = $.panel?.querySelector('#n_button');
+    if (button) button.innerText = '开始刷课';
+    const pauseButton = $.panel?.querySelector('#n_pause');
+    if (pauseButton) pauseButton.innerText = '暂停刷课';
+  }
+  const controller = {
+    stop() {
+      state.stopped = true;
+      clearInterval(state.timer);
+      state.media?.pause();
+      unbind();
+      if ($.aiWorkspaceController === controller) $.aiWorkspaceController = null;
+    },
+    applyRate() {
+      const media = state.media;
+      if (!media || media.readyState < 1) return;
+      if (!$.ykt_speed(media)) media.playbackRate = Number(basicConf.rate) || 2;
+    }
+  };
+  function navigate(node) {
+    state.navigation = { from: getRoute(), started: Date.now() };
+    $.alertMessage(`正在打开：${titleOf(node)}`);
+    node.click();
+  }
+  function advance() {
+    if ($.isPaused() || state.navigation || state.stopped) return;
+    state.completed.add(state.route);
+    const leaves = getLeaves();
+    const activeIndex = leaves.findIndex(node => node.classList.contains('is-active'));
+    if (activeIndex < 0) {
+      finish('视频已结束，但未找到当前目录项，请手动选择下一节');
+      return;
+    }
+    const next = leaves.slice(activeIndex + 1).find(isMediaLeaf);
+    $.updateProgress({ completed: state.completed.size });
+    if (next) navigate(next);
+    else finish('当前目录中的视频和音频已播放完成');
+  }
+  function play(media) {
+    if (!media.paused || Date.now() - state.lastPlayAt < 2000) return;
+    state.lastPlayAt = Date.now();
+    media.play()?.catch(error => {
+      if (state.stopped || state.media !== media || $.isPaused()) return;
+      if (error.name === 'NotAllowedError') finish('浏览器阻止自动播放，请先点击播放器，再点击开始刷课');
+      else if (error.name !== 'AbortError') finish(`媒体播放失败：${error.message}`);
+    });
+  }
+  function tick() {
+    if (state.stopped) return;
+    if (location.pathname !== courseRoot && !location.pathname.startsWith(courseRoot + '/')) {
+      finish('已离开当前课程，自动播放已停止');
+      return;
+    }
+    const route = getRoute();
+    if (route !== state.route) {
+      unbind();
+      state.route = route;
+      state.changedAt = state.waitingSince = Date.now();
+      state.lastPlayAt = 0;
+    }
+    if (state.navigation) {
+      if (route === state.navigation.from) {
+        if (!$.isPaused() && Date.now() - state.navigation.started > 30000) finish('目录切换超时，请检查页面后重试');
+        return;
+      }
+      state.navigation = null;
+    }
+    if (!isMediaRoute()) {
+      finish('当前内容不是视频或音频，自动播放已停止');
+      return;
+    }
+    if ($.isPaused()) {
+      // A new SPA player may autoplay after pause was pressed during navigation.
+      $.pauseAllMedia();
+      return;
+    }
+    // SPA navigation may leave the old player in the DOM briefly.
+    if (Date.now() - state.changedAt < 600) return;
+    const media = document.querySelector('video, audio');
+    if (!media || media.readyState < 1) {
+      if (media) play(media);
+      if (Date.now() - state.waitingSince > 90000) finish('媒体加载超时，请检查网络或刷新播放器');
+      return;
+    }
+    if (state.media !== media) {
+      unbind();
+      state.media = media;
+      const onPlaying = () => { state.started = true; };
+      const onEnded = () => { if (state.prepared && state.started) state.ended = true; };
+      const onError = () => finish('媒体加载失败，请刷新播放器后重试');
+      state.listeners = [['playing', onPlaying], ['ended', onEnded], ['error', onError]];
+      for (const [type, handler] of state.listeners) media.addEventListener(type, handler);
+    }
+    if (!state.prepared) {
+      // A completed lesson can resume at its last frame; replay it without altering server progress.
+      if (media.ended || (Number.isFinite(media.duration) && media.duration > 0 && media.currentTime >= media.duration - 0.05)) {
+        media.currentTime = 0;
+      }
+      state.prepared = true;
+      state.started = !media.paused && !media.ended;
+      const mediaLeaves = getLeaves().filter(isMediaLeaf);
+      const active = mediaLeaves.findIndex(node => node.classList.contains('is-active'));
+      $.updateProgress({ total: mediaLeaves.length, completed: state.completed.size, current: active + 1, currentTitle: titleOf(mediaLeaves[active]) });
+      $.alertMessage(`正在播放：${titleOf(mediaLeaves[active])}`);
+    }
+    if (state.ended) {
+      advance();
+      return;
+    }
+    media.volume = 0;
+    controller.applyRate();
+    play(media);
+  }
+  $.aiWorkspaceController = controller;
+  $.setRunning(true);
+  if (!isMediaRoute()) {
+    const mediaLeaves = getLeaves().filter(isMediaLeaf);
+    const first = mediaLeaves.find(node => !node.querySelector('.icon-yuanquangou-mianzhuang')) || mediaLeaves[0];
+    if (!first) {
+      finish('当前目录没有视频或音频，请先展开课程目录');
+      return false;
+    }
+    navigate(first);
+  }
+  if (document.body.innerText.includes('完成度不再更新')) $.alertMessage('本课程已过截止时间：可以播放，平台完成度不再更新');
+  state.timer = setInterval(tick, 500);
+  tick();
+  return true;
+}
+
 function start() {  // 脚本入口函数
   const url = location.host;
   const pathName = location.pathname.split('/');
   const matchURL = url + pathName[0] + '/' + pathName[1] + '/' + pathName[2];
   $.alertMessage(`正在为您匹配${matchURL}的处理逻辑...`);
-  if (matchURL.includes('yuketang.cn/v2/web') || matchURL.includes('gdufemooc.cn/v2/web')) {
+  if (/^\/ai-workspace\/lms-graph\//.test(location.pathname)) {
+    return yuketang_ai_workspace();
+  } else if (matchURL.includes('yuketang.cn/v2/web') || matchURL.includes('gdufemooc.cn/v2/web')) {
     const started = yuketang_v2();
     $.setRunning(started !== false);
     return started;
@@ -1914,7 +2098,7 @@ function start() {  // 脚本入口函数
   } else {
     $.setRunning(false);
     $.panel.querySelector("#n_button").innerText = "开始刷课";
-    $.alertMessage(`这不是刷课的页面哦，刷课页面的网址应该匹配 */v2/web/* 或 */pro/lms/*`)
+    $.alertMessage('请在课程目录或视频页面使用，支持 /v2/web/、/pro/lms/ 和 /ai-workspace/lms-graph/')
     return false;
   }
 }
